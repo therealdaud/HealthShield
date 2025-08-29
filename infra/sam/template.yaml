@@ -1,0 +1,123 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: HeatShield - minimal stack (IoT -> single Lambda -> DynamoDB; optional SNS; Function URL)
+
+Parameters:
+  TableName:
+    Type: String
+    Default: heatshield
+  SiteId:
+    Type: String
+    Default: tampa_usf_valet
+  CreateSns:
+    Type: String
+    AllowedValues: ["true","false"]
+    Default: "false"
+
+Globals:
+  Function:
+    Runtime: python3.11
+    Timeout: 20
+    MemorySize: 256
+    Tracing: Active
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref TableName
+        SITE_ID: !Ref SiteId
+        REGION: !Ref AWS::Region
+        SNS_TOPIC_ARN: !If [UseSNS, !Ref NudgesTopic, ""]
+    Policies:
+      - DynamoDBCrudPolicy:
+          TableName: !Ref TableName
+
+Conditions:
+  UseSNS: !Equals [!Ref CreateSns, "true"]
+
+Resources:
+  HeatshieldTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref TableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  CoreFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: heatshield-core
+      Handler: app.handler
+      CodeUri: ../../services/core/
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TableName
+        - !If
+          - UseSNS
+          - Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref NudgesTopic
+          - Ref: AWS::NoValue
+
+  CoreInvokePermissionForIoT:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref CoreFunction
+      Principal: iot.amazonaws.com
+
+  IoTRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: heatshield_min_ingest
+      TopicRulePayload:
+        AwsIotSqlVersion: "2016-03-23"
+        Sql: "SELECT * FROM 'heatshield/site/+/device/+/telemetry'"
+        Actions:
+          - Lambda:
+              FunctionArn: !GetAtt CoreFunction.Arn
+        RuleDisabled: false
+
+  CoreFuncUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !Ref CoreFunction
+      AuthType: NONE
+      Cors:
+        AllowOrigins: ["*"]
+        AllowMethods: ["GET","POST","OPTIONS"]
+        AllowHeaders: ["*"]
+
+  CoreFuncUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunctionUrl
+      FunctionName: !Ref CoreFunction
+      Principal: "*"
+      FunctionUrlAuthType: "NONE"
+
+  NudgesTopic:
+    Type: AWS::SNS::Topic
+    Condition: UseSNS
+    Properties:
+      TopicName: heatshield-nudges
+
+Outputs:
+  FunctionUrl:
+    Description: Call this URL to fetch current risk
+    Value: !GetAtt CoreFuncUrl.FunctionUrl
+  SnsTopicArn:
+    Condition: UseSNS
+    Description: SNS topic ARN (subscribe phone numbers in console)
+    Value: !Ref NudgesTopic
