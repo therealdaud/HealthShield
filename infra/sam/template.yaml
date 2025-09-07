@@ -26,9 +26,7 @@ Globals:
         SITE_ID: !Ref SiteId
         REGION: !Ref AWS::Region
         SNS_TOPIC_ARN: !If [UseSNS, !Ref NudgesTopic, ""]
-    Policies:
-      - DynamoDBCrudPolicy:
-          TableName: !Ref TableName
+    # NOTE: Do NOT put Policies under Globals.Function (SAM doesn't support it here)
 
 Conditions:
   UseSNS: !Equals [!Ref CreateSns, "true"]
@@ -60,7 +58,7 @@ Resources:
       FunctionName: heatshield-core
       Handler: app.handler
       CodeUri: ../../services/core/
-      Policies:
+      Policies:                               # <— Policies belong on the resource, not Globals
         - DynamoDBCrudPolicy:
             TableName: !Ref TableName
         - !If
@@ -97,7 +95,7 @@ Resources:
       AuthType: NONE
       Cors:
         AllowOrigins: ["*"]
-        AllowMethods: ["GET","POST","OPTIONS"]
+        AllowMethods: ["GET","POST"]          # <— remove OPTIONS here
         AllowHeaders: ["*"]
 
   CoreFuncUrlPermission:
