@@ -1,0 +1,11 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "heatshield-mvp"
+resolve_s3 = true
+s3_prefix = "heatshield-mvp"
+region = "us-east-1"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM"
+parameter_overrides = "TableName=\"heatshield\" SiteId=\"tampa_usf_valet\" CreateSns=\"false\""
+image_repositories = []

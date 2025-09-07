@@ -2,15 +2,17 @@ import os, json, time, math, decimal, boto3
 from urllib.parse import parse_qs
 from datetime import datetime
 
+# ---------- env ----------
 TABLE_NAME = os.environ["TABLE_NAME"]
 SITE_ID    = os.environ.get("SITE_ID", "tampa_usf_valet")
 SNS_ARN    = os.environ.get("SNS_TOPIC_ARN", "")
 
+# ---------- aws clients ----------
 dynamodb = boto3.resource("dynamodb")
 table    = dynamodb.Table(TABLE_NAME)
 sns      = boto3.client("sns") if SNS_ARN else None
 
-# ----------------------- basic HI -----------------------
+# ---------- utils: base HI ----------
 def c_to_f(c): return (c * 9.0/5.0) + 32.0
 
 def heat_index_f(T_f, RH):
@@ -30,7 +32,7 @@ def next_break_eta(bucket):
     if bucket == "Orange": return 12
     return 30
 
-# ----------------------- persistence -----------------------
+# ---------- persistence ----------
 def put_reading(site_id, device_id, ts, temp_c, rh, hi_f, hi_eff_f):
     ttl = int(time.time()) + 7*24*3600
     item = {
@@ -61,41 +63,41 @@ def put_user_profile(site_id, user_id, prof):
     item = {"pk": f"PROFILE#{site_id}", "sk": f"USER#{user_id}", **prof}
     table.put_item(Item=item)
 
-# ----------------------- personalization -----------------------
+# ---------- defaults & personalization ----------
 def default_profile(user_id="demo_user"):
-    # Sensible defaults (units in °F deltas)
     return {
         "user_id": user_id,
-        "exertion_default": 2,     # 1..5
-        "acclim_days": 0,          # 0..14
-        "clothing": "normal",      # light|normal|heavy
-        "wind_mps": 1.0,           # if you don't fetch wind, set a site default
-        "coeff": {                 # tunable “HI+” weights
-            "k_solar": 6.0,        # midday sun adds up to ~6°F
-            "k_wind": 4.0,         # 4 m/s wind cools ~4°F
-            "k_exertion": 3.0,     # from level 2 baseline to level 5
-            "k_acclim": -2.0,      # fully acclimated (-2°F by 14 days)
-            "k_clothing": 2.0      # heavy adds ~2°F; normal ~1.2; light ~0
+        "exertion_default": 2,    # if phone accel missing
+        "acclim_days": 0,         # 0..14
+        "clothing": "normal",     # light|normal|heavy
+        "wind_mps": 1.0,
+        "coeff": {
+            "k_solar": 6.0,
+            "k_wind": 4.0,
+            "k_exertion": 3.0,
+            "k_acclim": -2.0,
+            "k_clothing": 2.0,
+            "k_duration": 2.0,    # cumulative exertion heat
+            "k_thermal": 2.0,     # cumulative ambient heat
+            "k_dehyd": 1.0        # dehydration penalty
         }
     }
 
-def solar_intensity_factor(ts_local: int, in_shade: bool):
-    """
-    Very light proxy for solar load: triangular shape peaking ~1pm.
-    Returns 0..1, reduced strongly if in shade.
-    """
-    hour = datetime.fromtimestamp(ts_local).hour  # uses Lambda's local tz (UTC by default)
-    # If your Lambda runs UTC, adjust to local (e.g., Tampa UTC-4):
-    hour = (hour - 4) % 24
-    peak = 13
-    width = 6  # ~10am-4pm active window
-    val = max(0.0, 1.0 - abs(hour - peak)/ (width/2))
-    if in_shade:
-        val *= 0.3
-    return min(1.0, max(0.0, val))
-
 def clothing_factor(clothing: str):
     return {"light": 0.0, "normal": 0.6, "heavy": 1.0}.get(clothing, 0.6)
+
+def solar_intensity_factor(ts_local: int, in_shade: bool):
+    """
+    Simple day curve peaking ~1pm local. If your Lambda runs UTC, adjust to local.
+    Here we shift by -4 hours (ET summer). Change if needed.
+    """
+    hour = datetime.fromtimestamp(ts_local).hour
+    hour = (hour - 4) % 24   # naive ET offset; adjust for your region as needed
+    peak = 13
+    width = 6  # 10a-4p window
+    val = max(0.0, 1.0 - abs(hour - peak)/(width/2))
+    if in_shade: val *= 0.3
+    return min(1.0, max(0.0, val))
 
 def personalized_hi(hi_base_f: float, ts: int, profile: dict, state: dict):
     c = profile.get("coeff", {})
@@ -111,14 +113,11 @@ def personalized_hi(hi_base_f: float, ts: int, profile: dict, state: dict):
     wind     = float(profile.get("wind_mps", 1.0))
     clo_idx  = clothing_factor(profile.get("clothing","normal"))
 
-    # 0..1 solar factor, reduced if shaded
     solar = solar_intensity_factor(ts, in_shade)
-
-    # Normalize pieces to 0..1 and combine as °F delta
-    wind_norm     = min(wind, 4.0) / 4.0                  # cap 4 m/s
-    exertion_norm = (max(1, min(exertion,5)) - 2) / 3.0   # -0.33..1.0 from baseline 2
-    acclim_norm   = min(max(acclim, 0), 14) / 14.0        # 0..1
-    clo_norm      = clo_idx                               # 0.0 light, 0.6 normal, 1.0 heavy
+    wind_norm     = min(max(wind, 0.0), 4.0) / 4.0
+    exertion_norm = (max(1, min(exertion,5)) - 2) / 3.0
+    acclim_norm   = min(max(acclim, 0), 14) / 14.0
+    clo_norm      = clo_idx
 
     delta_f = (
         k_solar * solar
@@ -129,7 +128,47 @@ def personalized_hi(hi_base_f: float, ts: int, profile: dict, state: dict):
     )
     return hi_base_f + delta_f
 
-# ----------------------- nudges -----------------------
+# ---------- cumulative loads (duration, thermal, dehydration) ----------
+def smooth(prev, x, dt_s, tau_s):
+    tau_s = max(1.0, float(tau_s))
+    dt_s = max(0.0, float(dt_s))
+    alpha = 1.0 - math.exp(-dt_s / tau_s)
+    return float(prev) + alpha * (float(x) - float(prev))
+
+def update_cumulative_loads(state, ts_now, hi_base_f, exertion_level, in_shade, wind_mps):
+    """
+    Updates/returns (duration_load, thermal_load, since_hydration_min) in state.
+    All loads 0..1. Faster recovery in shade/wind.
+    """
+    last_ts = int(state.get("last_update_ts", ts_now))
+    dt = max(1, min(ts_now - last_ts, 300))   # cap step at 5 min
+
+    e_norm = max(0.0, (int(exertion_level) - 2) / 3.0)         # 0..1 (level 2 baseline)
+    t_norm = max(0.0, (hi_base_f - 95.0) / 30.0)               # 95..125F => 0..1
+    wind_norm = min(max(float(wind_mps), 0.0), 4.0) / 4.0
+    shade_norm = 1.0 if in_shade else 0.0
+
+    speedup = 1.0 + 0.6*shade_norm + 0.4*wind_norm
+    TAU_DUR = 10*60.0 / speedup
+    TAU_TH  = 20*60.0 / speedup
+
+    duration_prev = float(state.get("duration_load", 0.0))
+    thermal_prev  = float(state.get("thermal_load", 0.0))
+
+    duration_load = smooth(duration_prev, e_norm, dt, TAU_DUR)
+    thermal_load  = smooth(thermal_prev,  t_norm, dt, TAU_TH)
+
+    since_hyd = int(state.get("since_hydration_min", 0)) + int(dt/60)
+
+    state.update({
+        "duration_load": round(max(0.0, min(1.0, duration_load)), 4),
+        "thermal_load":  round(max(0.0, min(1.0, thermal_load)),  4),
+        "last_update_ts": ts_now,
+        "since_hydration_min": since_hyd
+    })
+    return state["duration_load"], state["thermal_load"], since_hyd
+
+# ---------- nudges ----------
 def maybe_send_nudge(user_id, new_bucket, state_now):
     if not sns: return
     if new_bucket not in ("Orange","Red"): return
@@ -149,7 +188,7 @@ def maybe_send_nudge(user_id, new_bucket, state_now):
     except Exception as e:
         print("SNS publish failed:", e)
 
-# ----------------------- handlers -----------------------
+# ---------- handlers ----------
 def handle_iot(event):
     msg = event.get("message", event)
     try:
@@ -167,8 +206,31 @@ def handle_iot(event):
     user_id = "demo_user"
     state   = get_user_state(site_id, user_id) or {}
     prof    = get_user_profile(site_id, user_id)
+    coeff   = prof.get("coeff", {})
 
-    hi_eff  = personalized_hi(hi, ts, prof, state)
+    in_shade = bool(state.get("in_shade", False))
+    exertion = int(state.get("exertion_level", prof.get("exertion_default", 2)))
+    wind     = float(prof.get("wind_mps", 1.0))
+
+    # time-aware loads
+    dur_load, th_load, since_hyd = update_cumulative_loads(
+        state, ts, hi_base_f=hi, exertion_level=exertion, in_shade=in_shade, wind_mps=wind
+    )
+
+    # personalized baseline
+    hi_eff = personalized_hi(hi, ts, prof, state)
+
+    # add cumulative penalties
+    k_dur   = float(coeff.get("k_duration", 2.0))
+    k_th    = float(coeff.get("k_thermal", 2.0))
+    k_dehyd = float(coeff.get("k_dehyd", 1.0))
+    H = min(1.0, since_hyd / 60.0)  # 0..1, 1 hr without hydrating -> 1.0
+
+    hi_eff += k_dur*dur_load + k_th*th_load + k_dehyd*H
+
+    # clamp to sane bounds
+    hi_eff = max(temp_f, min(hi + 12.0, hi_eff))
+
     bucket  = bucket_from_hi(hi_eff)
     eta     = next_break_eta(bucket)
 
@@ -222,12 +284,14 @@ def handle_http(event):
             "hi_nowcast_f": float(state.get("hi_nowcast_f", 0.0)),
             "bucket": state.get("risk_bucket","Green"),
             "next_break_eta_min": int(state.get("next_break_eta_min", 30)),
-            "source": state.get("source","sensor")
+            "source": state.get("source","sensor"),
+            "duration_load": float(state.get("duration_load", 0.0)),
+            "thermal_load": float(state.get("thermal_load", 0.0)),
+            "since_hydration_min": int(state.get("since_hydration_min", 0))
         }
         return http_json(out)
 
     if method == "POST" and path.endswith("/profile"):
-        # body: { user_id?, exertion_default, acclim_days, clothing, wind_mps, coeff? }
         body = json.loads(event.get("body","") or "{}")
         uid  = body.get("user_id", user_id)
         prof = get_user_profile(site_id, uid)
@@ -236,13 +300,14 @@ def handle_http(event):
         return http_json({"ok": True, "profile": prof})
 
     if method == "POST" and path.endswith("/state"):
-        # body: { user_id?, in_shade?, exertion_level? }
         body = json.loads(event.get("body","") or "{}")
         uid  = body.get("user_id", user_id)
         st   = get_user_state(site_id, uid) or {}
         if "in_shade" in body: st["in_shade"] = bool(body["in_shade"])
         if "exertion_level" in body:
             lvl = int(body["exertion_level"]); lvl = max(1, min(lvl,5)); st["exertion_level"] = lvl
+        if body.get("hydrated_now"):
+            st["since_hydration_min"] = 0
         put_user_state(site_id, uid, st)
         return http_json({"ok": True, "state": st})
 
