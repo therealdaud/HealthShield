@@ -10,4 +10,4 @@ Core features:
 - Minimal, low-cost serverless architecture; easy to deploy and maintain
 
 Why it exists:
-Standard heat metrics often miss personal context. HeatShield adds lightweight user inputs to refine risk—helping students, workers, and athletes make safer choices in hot conditions.
+Standard heat metrics often miss personal context. HeatShield adds lightweight user inputs to refine risk—helping students, workers, and athletes make safer choices under hot conditions.
